@@ -1,6 +1,7 @@
 from ctypes import (POINTER, byref, c_int, c_int64, c_double, c_float,
                     c_uint32, c_void_p)
 import os
+import time
 
 import numpy as np
 
@@ -91,8 +92,42 @@ class HIPRocBLASKernels(HIPKernelProvider):
             pass
 
     def mul(self, a, b, out, alpha=1.0, beta=0.0):
+        tstart = time.perf_counter()
+        try:
+            return self._mul(a, b, out, alpha, beta)
+        finally:
+            total_s = time.perf_counter() - tstart
+            times = getattr(self.backend, '_kernel_create_times', None)
+            if times is None:
+                self.backend._kernel_create_times = times = {}
+
+            times['rocblas'] = total_s
+
+            details = getattr(self.backend, '_kernel_create_details', None)
+            if details is not None:
+                for detail in reversed(details):
+                    if (detail.get('provider') == 'rocblas' and
+                        'total_s' not in detail):
+                        detail['total_s'] = total_s
+                        break
+
+    def _mul(self, a, b, out, alpha=1.0, beta=0.0):
+        detail = {
+            'provider': 'rocblas',
+            'cache_hit': '',
+            'candidate_count': 0,
+            'selected': '',
+            'output_save_s': 0.0,
+            'autotuning_s': 0.0,
+            'restore_s': 0.0
+        }
+        details = getattr(self.backend, '_kernel_create_details', None)
+        if details is not None:
+            details.append(detail)
+
         h, w = self._handle, self._wrappers
         cstream = self._cstream
+        force_algo = os.environ.get('PYFR_ROCBLAS_FORCE_ALGO')
 
         # Ensure the matrices are compatible
         if a.nrow != out.nrow or a.ncol != b.nrow or b.ncol != out.ncol:
@@ -106,7 +141,8 @@ class HIPRocBLASKernels(HIPKernelProvider):
         A, B, C = b, a, out
 
         # Cache key
-        ckey = (A.dtype, alpha, beta, m, n, k, A.leaddim, B.leaddim, C.leaddim)
+        ckey = (A.dtype, alpha, beta, m, n, k, A.leaddim, B.leaddim,
+                C.leaddim, force_algo)
 
         # Do not transpose either A or B
         opA = opB = w.OPERATION_NONE
@@ -136,11 +172,13 @@ class HIPRocBLASKernels(HIPKernelProvider):
 
         try:
             algo, dt = self._mul_cache[ckey]
+            detail['cache_hit'] = True
+            detail['selected'] = f'rocblas-algo-{algo if algo is not None else "default"}'
         except KeyError:
+            detail['cache_hit'] = False
             ifac = self.backend.autotune_ifac
 
-            # Check if sizes fit in 32-bit for gemm_ex autotuning
-            if all(sz <= 2**31 - 1 for sz in ckey[3:]):
+            def get_solution_indices():
                 def get_solutions(sidx):
                     size_ct = c_int(len(sidx) if sidx is not None else 0)
                     w.rocblas_gemm_ex_get_solutions(
@@ -153,28 +191,90 @@ class HIPRocBLASKernels(HIPKernelProvider):
 
                 sidx = (c_int * min(get_solutions(None), self.nkerns - 1))()
                 get_solutions(sidx)
-                candidates = [None, *sidx]
+
+                return list(sidx)
+
+            if force_algo is not None:
+                if force_algo.lower() in ('default', 'none'):
+                    candidates = [None]
+                else:
+                    try:
+                        falgo = int(force_algo)
+                    except ValueError:
+                        raise ValueError(
+                            'PYFR_ROCBLAS_FORCE_ALGO must be an integer '
+                            "solution index, 'default', or 'none'"
+                        )
+
+                    # Query solutions in this process before forcing an index.
+                    # Some rocBLAS solution IDs are not useful unless the
+                    # solution table has been materialized for this GEMM.
+                    if all(sz <= 2**31 - 1 for sz in ckey[3:-1]):
+                        solutions = get_solution_indices()
+                        if falgo not in solutions:
+                            print(
+                                f'rocBLAS force warning: algo={falgo} is not '
+                                f'in the current solution list',
+                                flush=True
+                            )
+
+                    candidates = [falgo]
+            # Check if sizes fit in 32-bit for gemm_ex autotuning
+            elif all(sz <= 2**31 - 1 for sz in ckey[3:-1]):
+                candidates = [None, *get_solution_indices()]
             else:
                 candidates = [None]
 
             # Save a copy of the contents of the output matrix
+            tout = time.perf_counter()
             out_np = getattr(out, 'parent', out).get()
+            detail['output_save_s'] += time.perf_counter() - tout
 
+            tautotune = time.perf_counter()
             best_kern = None
             for algo in candidates:
                 try:
                     dt = self._benchmark(lambda s: gemm(s, algo))
+                    detail['candidate_count'] += 1
+                    print(
+                        f'rocBLAS autotune: algo='
+                        f'{algo if algo is not None else "default"} '
+                        f'time={dt:.6e}s',
+                        flush=True
+                    )
                     if best_kern is None or dt < ifac*best_kern[-1]:
                         best_kern = algo, dt
                 # In the case of invalid values raised by rocblas
-                except RocBLASInvalidValue:
-                    pass
+                except RocBLASError as exc:
+                    print(
+                        f'rocBLAS autotune: algo='
+                        f'{algo if algo is not None else "default"} '
+                        f'failed ({type(exc).__name__})',
+                        flush=True
+                    )
+
+                    if force_algo is not None:
+                        raise
+
+            if best_kern is None:
+                raise RocBLASInternalError
+            detail['autotuning_s'] += time.perf_counter() - tautotune
 
             # Restore the output matrix
+            trestore = time.perf_counter()
             getattr(out, 'parent', out).set(out_np)
+            detail['restore_s'] += time.perf_counter() - trestore
 
             # Update the cache
             self._mul_cache[ckey] = algo, dt = best_kern
+
+            print(
+                f'rocBLAS autotune selected: algo='
+                f'{algo if algo is not None else "default"} '
+                f'time={dt:.6e}s',
+                flush=True
+            )
+            detail['selected'] = f'rocblas-algo-{algo if algo is not None else "default"}'
 
         class MulKernel(HIPKernel):
             def add_to_graph(self, graph, deps):
@@ -189,4 +289,7 @@ class HIPRocBLASKernels(HIPKernelProvider):
             def run(self, stream):
                 gemm(stream, algo)
 
-        return MulKernel(mats=[a, b, out], dt=dt)
+        mk = MulKernel(mats=[a, b, out], dt=dt)
+        mk.kernel_variant = f'rocblas-algo-{algo if algo is not None else "default"}'
+
+        return mk

@@ -1,5 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
+import os
+import time
 from weakref import finalize
 
 from gimmik import HIPMatMul
@@ -51,16 +53,22 @@ def _warmup_worker(_):
 
 def _render_compile_candidate(args):
     (idx, arr, dtype, alpha, beta, aligne, kname, gcn_arch, warp_size,
-     compiler_version) = args
+     force_variant, compiler_version) = args
 
     mm = HIPMatMul(alpha*arr, beta=beta, aligne=aligne)
     src, meta = mm.render_candidate(idx, dtype, kname=kname,
                                     gcn_arch=gcn_arch,
                                     warp_size=warp_size)
 
+    tplname = meta.get('tplname', '')
+    variant = meta.get('desc', tplname)
+
+    if force_variant and force_variant != variant:
+        return idx, None
+
     _warm_kernel_cache(src, gcn_arch, compiler_version)
 
-    return src, meta
+    return idx, (src, meta, variant)
 
 
 class HIPGiMMiKKernels(HIPKernelProvider):
@@ -105,6 +113,45 @@ class HIPGiMMiKKernels(HIPKernelProvider):
             pass
 
     def mul(self, a, b, out, alpha=1.0, beta=0.0):
+        tstart = time.perf_counter()
+        try:
+            return self._mul(a, b, out, alpha, beta)
+        finally:
+            total_s = time.perf_counter() - tstart
+            times = getattr(self.backend, '_kernel_create_times', None)
+            if times is None:
+                self.backend._kernel_create_times = times = {}
+
+            times['gimmik'] = total_s
+
+            details = getattr(self.backend, '_kernel_create_details', None)
+            if details is not None:
+                for detail in reversed(details):
+                    if (detail.get('provider') == 'gimmik' and
+                        'total_s' not in detail):
+                        detail['total_s'] = total_s
+                        break
+
+    def _mul(self, a, b, out, alpha=1.0, beta=0.0):
+        detail = {
+            'provider': 'gimmik',
+            'cache_hit': '',
+            'candidate_count': 0,
+            'selected': '',
+            'output_save_s': 0.0,
+            'autotuning_s': 0.0,
+            'generate_s': 0.0,
+            'parallel_compile_wall_s': 0.0,
+            'build_kernel_s': 0.0,
+            'benchmark_s': 0.0,
+            'restore_s': 0.0,
+        }
+        details = getattr(self.backend, '_kernel_create_details', None)
+        if details is not None:
+            details.append(detail)
+
+        force_variant = os.environ.get('PYFR_GIMMIK_FORCE_VARIANT')
+
         # Ensure the matrices are compatible
         if a.nrow != out.nrow or a.ncol != b.nrow or b.ncol != out.ncol:
             raise ValueError('Incompatible matrices for out = a*b')
@@ -127,22 +174,30 @@ class HIPGiMMiKKernels(HIPKernelProvider):
             aligne = None
 
         # Cache key
-        ckey = (a.mid, alpha, beta, aligne)
+        ckey = (a.mid, alpha, beta, aligne, force_variant)
 
         # Check the kernel cache
         try:
-            kern, block, grid_y, ncolsv, dt = self._mul_kerns[ckey]
+            kern, block, grid_y, ncolsv, dt, variant = self._mul_kerns[ckey]
+            detail['cache_hit'] = True
+            detail['selected'] = variant
         except KeyError:
+            detail['cache_hit'] = False
             ifac = self.backend.autotune_ifac
             kname = f'gimmik_mm_{arr.shape[0]}x{arr.shape[1]}'
             kdata = None
             best_kern = None
 
             # Save a copy of the contents of the output matrix
+            tout = time.perf_counter()
             out_np = getattr(out, 'parent', out).get()
+            detail['output_save_s'] += time.perf_counter() - tout
 
-            def benchmark_candidate(src, meta):
+            def benchmark_candidate(src, meta, variant):
+                tbuild = time.perf_counter()
                 kern = self._build_kernel(kname, src, 'iPiPi')
+                detail['build_kernel_s'] += time.perf_counter() - tbuild
+                detail['candidate_count'] += 1
 
                 grid_y = meta.get('grid_y', 1)
                 ncolsv = (
@@ -154,9 +209,20 @@ class HIPGiMMiKKernels(HIPKernelProvider):
                 params.set_args(n, b, ldb, out, ldc)
 
                 # Obtain the runtime
+                tbench = time.perf_counter()
                 dt = self._benchmark(
                     lambda stream: kern.exec_async(stream, params),
                     nbench=self.nbench
+                )
+                detail['benchmark_s'] += time.perf_counter() - tbench
+
+                tplname = meta.get('tplname', '')
+                print(
+                    f'GiMMiK autotune: tplname={tplname} variant={variant} '
+                    f'block={meta["block"]} shared={meta.get("shared", 0)} '
+                    f'ncolsv={ncolsv} time={dt:.6e}s regs={kern.nreg} '
+                    f'local_mem={kern.local_mem}',
+                    flush=True
                 )
 
                 kdata = {
@@ -165,7 +231,7 @@ class HIPGiMMiKKernels(HIPKernelProvider):
                     'local_mem': kern.local_mem
                 }
 
-                return kern, meta['block'], grid_y, ncolsv, dt, kdata
+                return kern, meta['block'], grid_y, ncolsv, dt, variant, kdata
 
             def update_best(bench):
                 nonlocal best_kern
@@ -175,56 +241,98 @@ class HIPGiMMiKKernels(HIPKernelProvider):
 
             mm = HIPMatMul(alpha*arr, beta=beta, aligne=aligne)
 
-            if self.parallel_compile:
-                gcn_arch = self.backend.props['gcn_arch_name']
-                warp_size = self.backend.props['warp_size']
-                count = min(
-                    self.nkerns,
-                    mm.candidate_count(a.dtype, gcn_arch=gcn_arch,
-                                       warp_size=warp_size)
-                )
-                args = [
-                    (
-                        idx, arr, a.dtype, alpha, beta, aligne, kname,
-                        gcn_arch, warp_size, self.backend.compiler.version
+            tautotune = time.perf_counter()
+            try:
+                if self.parallel_compile:
+                    gcn_arch = self.backend.props['gcn_arch_name']
+                    warp_size = self.backend.props['warp_size']
+                    count = min(
+                        self.nkerns,
+                        mm.candidate_count(a.dtype, gcn_arch=gcn_arch,
+                                           warp_size=warp_size)
                     )
-                    for idx in range(count)
-                ]
+                    args = [
+                        (
+                            idx, arr, a.dtype, alpha, beta, aligne, kname,
+                            gcn_arch, warp_size, force_variant,
+                            self.backend.compiler.version
+                        )
+                        for idx in range(count)
+                    ]
 
-                candidates = list(
-                    self.parallel_compile_pool.map(
-                        _render_compile_candidate, args
+                    twall = time.perf_counter()
+                    candidates = list(
+                        self.parallel_compile_pool.map(
+                            _render_compile_candidate, args
+                        )
+                    ) if args else []
+                    detail['parallel_compile_wall_s'] = (
+                        time.perf_counter() - twall
                     )
-                ) if args else []
 
-                for src, meta in candidates:
-                    update_best(benchmark_candidate(src, meta))
-            else:
-                kgen = mm.kernels(
-                    a.dtype, kname=kname,
-                    gcn_arch=self.backend.props['gcn_arch_name'],
-                    warp_size=self.backend.props['warp_size']
-                )
+                    for idx, candidate in candidates:
+                        if candidate is None:
+                            continue
 
-                # Benchmark the sequence of kernels generated by GiMMiK
-                try:
-                    for i in range(self.nkerns):
-                        src, meta = kgen.send(kdata)
+                        src, meta, variant = candidate
+                        update_best(benchmark_candidate(src, meta, variant))
+                else:
+                    kgen = mm.kernels(
+                        a.dtype, kname=kname,
+                        gcn_arch=self.backend.props['gcn_arch_name'],
+                        warp_size=self.backend.props['warp_size']
+                    )
 
-                        bench = benchmark_candidate(src, meta)
-                        update_best(bench)
-                        kdata = bench[-1]
-                except StopIteration:
-                    pass
+                    # Benchmark the sequence of kernels generated by GiMMiK
+                    try:
+                        for i in range(self.nkerns):
+                            tgenerate = time.perf_counter()
+                            src, meta = kgen.send(kdata)
+                            detail['generate_s'] += (
+                                time.perf_counter() - tgenerate
+                            )
+
+                            tplname = meta.get('tplname', '')
+                            variant = meta.get('desc', tplname)
+
+                            if force_variant and force_variant != variant:
+                                kdata = None
+                                continue
+
+                            bench = benchmark_candidate(src, meta, variant)
+                            update_best(bench)
+                            kdata = bench[-1]
+
+                            if force_variant:
+                                break
+                    except StopIteration:
+                        pass
+            finally:
+                detail['autotuning_s'] += time.perf_counter() - tautotune
 
             # Restore the output matrix
+            trestore = time.perf_counter()
             getattr(out, 'parent', out).set(out_np)
+            detail['restore_s'] += time.perf_counter() - trestore
+
+            if best_kern is None:
+                raise NotSuitableError(
+                    f'GiMMiK variant {force_variant!r} is not available'
+                )
+
+            print(
+                f'GiMMiK autotune selected: variant={best_kern[5]} '
+                f'block={best_kern[1]} grid_y={best_kern[2]} '
+                f'ncolsv={best_kern[3]} time={best_kern[4]:.6e}s',
+                flush=True
+            )
 
             # Update the cache
             self._mul_kerns[ckey] = (
-                kern, block, grid_y, ncolsv, dt
+                kern, block, grid_y, ncolsv, dt, variant
             ) = best_kern
             finalize(a, lambda: self._mul_kerns.pop(ckey))
+            detail['selected'] = variant
 
         # Set the parameters
         grid = (-(-n // ncolsv), grid_y, 1)
@@ -238,4 +346,7 @@ class HIPGiMMiKKernels(HIPKernelProvider):
             def run(self, stream):
                 kern.exec_async(stream, params)
 
-        return MulKernel(mats=[a, b, out], dt=dt)
+        mk = MulKernel(mats=[a, b, out], dt=dt)
+        mk.kernel_variant = variant
+
+        return mk

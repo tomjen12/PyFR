@@ -78,9 +78,14 @@ class HIPBackend(BaseBackend):
         kprovs = [provider.HIPPointwiseKernelProvider,
                   blasext.HIPBlasExtKernels,
                   linalg.HIPLinalgKernels,
-                  packing.HIPPackingKernels,
-                  gimmik.HIPGiMMiKKernels,
-                  rocblas.HIPRocBLASKernels]
+                  packing.HIPPackingKernels]
+
+        if not cfg.getbool('backend-hip', 'disable-gimmik', False):
+            kprovs.append(gimmik.HIPGiMMiKKernels)
+
+        if not cfg.getbool('backend-hip', 'disable-rocblas', False):
+            kprovs.append(rocblas.HIPRocBLASKernels)
+
         self._providers = [k(self) for k in kprovs]
 
         # Pointwise kernels
